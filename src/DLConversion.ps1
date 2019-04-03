@@ -140,6 +140,8 @@ Param (
 	[string]$groupTypeOverride=$NULL,
 	[Parameter(Mandatory=$FALSE,Position=5)]
 	[boolean]$convertToContact=$TRUE
+	[Parameter(Mandatory=$FALSE,Position=6)]
+	[boolean]$upgradeOffice365Group=$FALSE
 )
 
 #---------------------------------------------------------[Initialisations]--------------------------------------------------------
@@ -239,10 +241,16 @@ $script:onPremisesMovedDLConfiguration = $NULL	#Holds the seetings of the distri
 [array]$script:originalRejectMessagesFrom = @()  #HOlds all the distribution lists where the converted DL had reject messages from rights.
 [array]$script:originalBypassModerationFromSendersOrMembers = @()
 [array]$script:originalManagedBy = @()
+[array]$script:originalForwardingSMTPAddress = @()
+[array]$script:originalForwardingAddress = @()
 $script:randomContactName = $NULL
 $script:remoteRoutingAddress = $NULL
 $script:wellKnownSelfAccountSid = "S-1-5-10"
 $script:onPremisesNewContactConfiguration = $NULL
+
+[int]$script:invalidOffice365GroupRecipients = 0
+[int]$script:validOffice365GroupRecipients = 0
+$script:dlSafeToUpgrade = $FALSE
 
 #-----------------------------------------------------------[Functions]------------------------------------------------------------
 
@@ -2145,6 +2153,7 @@ Function buildMembershipArray
 							Name = $functionRecipient.Name
 							PrimarySMTPAddressOrUPN = $functionRecipient.CustomAttribute2
 							RecipientType = "MailUniversalDistributionGroup"
+							RecipientTypeDetails = $functionRecipient.RecipientTypeDetails
 							RecipientOrUser = "Recipient"
 						}
 					}
@@ -2157,11 +2166,12 @@ Function buildMembershipArray
 							Name = $functionRecipient.Name
 							PrimarySMTPAddressOrUPN = $functionRecipient.PrimarySMTPAddress
 							RecipientType = $functionRecipient.RecipientType
+							RecipientTypeDetails = $functionRecipient.RecipientTypeDetails
 							RecipientOrUser = "Recipient"
 						}
 					}
 
-                    $functionOutput += $recipientObject
+					$functionOutput += $recipientObject
 				}
                 elseif ( $member.recipientType.toString() -eq "USER" )
                 {
@@ -2174,6 +2184,7 @@ Function buildMembershipArray
 						Name = $functionRecipient.Name
 						PrimarySMTPAddressOrUPN = $functionUser.UserprincipalName
 						RecipientType = "User"
+						RecipientTypeDetails = "User"
 						RecipientOrUser = "User"
 					}
 					
@@ -2196,7 +2207,64 @@ Function buildMembershipArray
                     Write-LogInfo -LogPath $script:sLogFile -Message "The following object was intentionally skipped - object type not replicated to Exchange Online" -ToScreen
                     Write-LogInfo -LogPath $script:sLogFile -Message $member.name -ToScreen
                 }
-            }
+			}
+			
+			#In order to facilitate upgrading to office 365 groups - we must ensure that no recipient found violates proper members in Office 365.
+
+			if ( $userObject -ne $NULL )
+			{
+				if ( $userObject.RecipientTypeDetails -eq "User" )
+				{
+					$script:validOffice365GroupRecipients+=1
+				}
+				else 
+				{
+					$script:invalidOffice365GroupRecipients+=1	
+				}
+			}
+			elseif ( $recipientObject -ne $NULL )
+			{
+				if ( $recipientObject.RecipientTypeDetails -eq "UserMailbox" )
+				{
+					$script:validOffice365GroupRecipients+=1
+				}
+				elseif ( $recipientObject.RecipientTypeDetails -eq "SharedMailbox" )
+				{
+					$script:validOffice365GroupRecipients+=1
+				}
+				elseif ( $recipientObject.RecipientTypeDetails -eq "TeamMailbox" )
+				{
+					$script:validOffice365GroupRecipients+=1
+				}
+				elseif ( $recipientObject.RecipientTypeDetails -eq "MailUser" )
+				{
+					$script:validOffice365GroupRecipients+=1
+				}
+				elseif ( $recipientObject.RecipientTypeDetails -eq "GuestMailUser" )
+				{
+					$script:validOffice365GroupRecipients+=1
+				}
+				elseif ( $recipientObject.RecipientTypeDetails -eq "RoomMailbox" )
+				{
+					$script:validOffice365GroupRecipients+=1
+				}
+				elseif ( $recipientObject.RecipientTypeDetails -eq "EquipmentMailbox" )
+				{
+					$script:validOffice365GroupRecipients+=1
+				}
+				elseif ( $recipientObject.RecipientTypeDetails -eq "User" )
+				{
+					$script:validOffice365GroupRecipients+=1
+				}
+				elseif ( $recipientObject.RecipientTypeDetails -eq "DisabledUser" )
+				{
+					$script:validOffice365GroupRecipients+=1
+				}
+				else
+				{
+					$script:invalidOffice365GroupRecipients+=1
+				}
+			}
 		}
 		
 		#Operation type is managed by array.
@@ -3361,9 +3429,12 @@ Function recordOriginalMultivaluedAttributes
 		#Record the identity of the moved distribution list (updated post move so we have correct identity)
 		
 		$functionGroupIdentity = $script:onPremisesMovedDLConfiguration.identity.tostring()	#Function variable to hold the identity of the group.
+		$functionGroupPrimarySMTPAddress = $script:onPremisesMovedDLConfiguration.primarySMTPAddress
+		$functionGroupDistinguishedName = $script:onPremisesMovedDLConfiguration.distinguishedName
 		$functionCommand = $NULL	#Holds the expression that we will be executing to determine multi-valued membership.
 		[array]$functionGroupArray = @()
 		$functionRecipientObject = $NULL
+		$forwardingAddress = $NULL
 		
 		Write-LogInfo -LogPath $script:sLogFile -Message 'The following group identity is the filtered name.' -toscreen
 		Write-LogInfo -LogPath $script:sLogFile -Message $functionGroupIdentity -toscreen
@@ -3482,6 +3553,52 @@ Function recordOriginalMultivaluedAttributes
 				}
 
 				$script:originalBypassModerationFromSendersOrMembers+=$functionRecipientObject		
+			}
+		}
+		Catch 
+		{
+			Write-LogError -LogPath $script:sLogFile -Message $_.Exception -toscreen
+			cleanupSessions
+			Stop-Log -LogPath $script:sLogFile -ToScreen
+			Break
+		}
+		Try 
+		{
+			#Locate all resources where the distribution group was set on forwarding SMTP Address
+
+			Write-LogInfo -LogPath $script:sLogFile -Message 'Gather all mailboxes with a forwarding SMTP address set that matches the DL...' -toscreen
+
+			$forwardingAddress = "smtp:"+$functionGroupPrimarySMTPAddress
+
+			$functionCommand = "Get-mailbox -resultsize unlimited -filter { ForwardingSMTPAddress -eq '$forwardingAddress' } -domainController '$script:adDomainController'"
+            
+            $script:originalForwardingSMTPAddress = Invoke-Expression $functionCommand
+		
+			foreach ( $member in $script:originalForwardingSMTPAddress )
+			{
+				Write-LogInfo -LogPath $script:sLogFile -Message $member.primarySMTPAddress -ToScreen
+			}
+		}
+		Catch 
+		{
+			Write-LogError -LogPath $script:sLogFile -Message $_.Exception -toscreen
+			cleanupSessions
+			Stop-Log -LogPath $script:sLogFile -ToScreen
+			Break
+		}
+		Try 
+		{
+			#Locate all resources where the distribution group was set on forwarding Address
+
+			Write-LogInfo -LogPath $script:sLogFile -Message 'Gather all mailboxes with a forwarding address set that matches the DL...' -toscreen
+
+			$functionCommand = "Get-mailbox -resultsize unlimited -filter { ForwardingAddress -eq '$functionGroupDistinguishedName' } -domainController '$script:adDomainController'"
+            
+            $script:originalForwardingAddress = Invoke-Expression $functionCommand
+		
+			foreach ( $member in $script:originalForwardingAddress )
+			{
+				Write-LogInfo -LogPath $script:sLogFile -Message $member.primarySMTPAddress -ToScreen
 			}
 		}
 		Catch 
@@ -4428,6 +4545,7 @@ Function resetOriginalDistributionListSettings
 }
 
 
+
 #-----------------------------------------------------------[Execution]------------------------------------------------------------
 
 #Create log file for operations within this script.
@@ -4670,8 +4788,11 @@ do
 	{
 		Start-PSCountdown -Minutes $script:adDomainReplicationTime -Title "Waiting for previous sync to finishn <or> allowing time for invoked sync to run" -Message "Waiting for previous sync to to finishn <or> allowing time for invoked sync to run"
 	}
-	invokeADConnect	
+
+	invokeADConnect
+
 	$script:aadconnectRetryRequired = $TRUE	
+
 } while ( $error -ne $NULL )
 
 refreshOffice365PowerShellSession
@@ -4817,7 +4938,6 @@ if ($convertToContact -eq $TRUE)
 	#The goal of this function is to locate those and record them.
 	#If the group migrating has permissions to itself - skip the recoridng as it's not required.
 
-
 	recordOriginalMultivaluedAttributes
 	
 	#Remove the on prmeises distribution list that was converted.
@@ -4865,6 +4985,60 @@ if ($convertToContact -eq $TRUE)
 	} while ( $error -ne $NULL )
 
 	$error.clear()
+}
+
+#At this point we have reached where we can test to see if we can upgrade the group to an office 365 group.
+
+if ( $upgradeOffice365Group -eq $TRUE )
+{
+	collectSharedMailboxes
+
+
+
+	#Test to see if the group in the service is not directory synchnoized from on premises.
+	#This should be obvious since the list was migrated by this point - but we check anyway for completeness.
+
+	Write-Loginfo -LogPath $script:sLogFile -Message "The administrator has elected to upgrade the group to an Office 365 Group post migration." -toscreen
+
+	if ( $script:newOffice365DLConfiguration.IsDirSynced -eq $FALSE )
+	{
+		Write-Loginfo -LogPath $script:sLogFile -Message "The group is not directory synchonized..." -toscreen
+
+		#Check to see if this distibution group is a member of any other groups.
+
+		if ( $script:onPremisesDLMemberOf.Count -eq 0 )
+		{
+			Write-Loginfo -LogPath $script:sLogFile -Message "The distribution group is not a member of another group..." -toscreen
+
+			#Check to see if this group has any other groups as members.
+
+			if ( $script:invalidOffice365GroupRecipients -eq 0 )
+			{
+				#Check to see if this group has any invalid member types.  Acceptable types are UserMailbox, SharedMailbox, TeamMailbox, MailUser
+
+				Write-Loginfo -LogPath $script:sLogFile -Message "Checking to see if the group has any member types that cannot be upgraded..." -toscreen
+
+				if ( $script:invalidOffice365GroupRecipients -eq 0 )
+				{
+					#Check to see if this group has more than 100 owners.
+
+					Write-Loginfo -LogPath $script:sLogFile -Message "CHecking to see if the group has > 100 owners...." -toscreen
+
+					if ( $script:onpremisesdlConfiguration.managedBy.count -gt 100 )
+					{
+						#Check to see if the distribution list has no owners.
+
+						Write-Loginfo -LogPath $script:sLogFile -Message "Checking to see if the distribution list has no owners...." -toscreen
+
+						if ( $script:onpremisesdlConfiguration.managedBy.count -eq 0 )
+						{
+							#Holding
+						}
+					}
+				}
+			}
+		}
+	}
 }
 
 cleanupSessions  #Clean up - were outta here.
