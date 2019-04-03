@@ -4470,6 +4470,7 @@ Function resetOriginalDistributionListSettings
 				}
 			}
 		}
+
 		if ( $script:originalManagedBy -ne $NULL )
 		{
 			Write-LogInfo -LogPath $script:sLogFile -Message 'Processing managed by...' -toscreen
@@ -4510,6 +4511,44 @@ Function resetOriginalDistributionListSettings
 						$functionGroup+=$script:onPremisesNewContactConfiguration.primarySMTPAddress
 
 						set-distributiongroup -identity $member.PrimarySMTPAddress -ManagedBy $functionGroup -domainController $script:adDomainController -BypassSecurityGroupManagerCheck
+					}
+					Catch
+					{
+						Write-LogError -LogPath $script:sLogFile -Message $_.Exception -toscreen
+						cleanupSessions
+						Stop-Log -LogPath $script:sLogFile -ToScreen
+						Break
+					}
+				}
+			}
+		}
+
+		if ( $script:originalForwardingSMTPAddress -ne $NULL )
+		{
+			Write-LogInfo -LogPath $script:sLogFile -Message 'Processing forwarding SMTP address on users...' -toscreen
+
+			#Group had bypass moderation from senders or members set on other groups.  Add mail contact to bypass moderation.
+
+			$functionArray = $script:originalForwardingSMTPAddress
+
+			foreach ( $member in $functionArray )
+            {
+				#Get the distribution list that had the group originall on bypass full bypass list to a variable.
+
+				Write-LogInfo -LogPath $script:sLogFile -Message 'Processing forwarding by: ' -toscreen
+				Write-LogInfo -LogPath $script:sLogFile $member.PrimarySMTPAddress -ToScreen
+
+				if ( $member.primarySMTPAddress -ne $script:onpremisesdlConfiguration.primarySMTPAddress )
+				{
+					Try
+					{
+						#Add the mail contact identity to the list and then restamp the entire list.
+						#This was done because array operations @{ADD=*} did not work against this attribute.
+
+						Write-LogInfo -LogPath $script:sLogFile -Message 'Adding the distribution group to the forwarding SMTP Address... ' -ToScreen
+						Write-LogInfo -LogPath $script:sLogFile $member.primarySMTPAddress -ToScreen
+
+						set-mailbox -identity $member.identity -forwardingSMTPAddress $script:onPremisesNewContactConfiguration
 					}
 					Catch
 					{
@@ -4991,10 +5030,6 @@ if ($convertToContact -eq $TRUE)
 
 if ( $upgradeOffice365Group -eq $TRUE )
 {
-	collectSharedMailboxes
-
-
-
 	#Test to see if the group in the service is not directory synchnoized from on premises.
 	#This should be obvious since the list was migrated by this point - but we check anyway for completeness.
 
